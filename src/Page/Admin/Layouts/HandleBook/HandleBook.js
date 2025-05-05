@@ -87,7 +87,7 @@ function HandleBook() {
     // Hàm tính tiền phạt
     const calculateFine = (books, record) => {
         const totalOverdueDays = books.reduce((total, book) => {
-            const dueDate = book.ngayhentra || record.ngayhentra;
+            const dueDate = book.newngayhentra || book.ngayhentra || record.ngayhentra;
             const overdueDays = calculateOverdueDays(dueDate, book.tinhtrang, book.overdueDays);
             return total + overdueDays;
         }, 0);
@@ -131,13 +131,13 @@ function HandleBook() {
         if (filterOverdue?.value === 'overdue') {
             filtered = filtered.filter((record) =>
                 record.books.some((book) =>
-                    calculateOverdueDays(book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) > 0
+                    calculateOverdueDays(book.newngayhentra || book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) > 0
                 )
             );
         } else if (filterOverdue?.value === 'notOverdue') {
             filtered = filtered.filter((record) =>
                 record.books.every((book) =>
-                    calculateOverdueDays(book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) === 0
+                    calculateOverdueDays(book.newngayhentra || book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) === 0
                 )
             );
         }
@@ -170,24 +170,33 @@ function HandleBook() {
             const data = Array.isArray(response.data) ? response.data : [];
             const updatedData = data.map((record) => ({
                 ...record,
-                books: record.books.map((book) => {
-                    if (book.tinhtrang && book.ngaytra) {
-                        const dueDate = new Date(book.ngayhentra || record.ngayhentra);
-                        const returnDate = new Date(book.ngaytra);
-                        dueDate.setHours(0, 0, 0, 0);
-                        returnDate.setHours(0, 0, 0, 0);
-                        const diffTime = returnDate.getTime() - dueDate.getTime();
-                        const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                        return {
-                            ...book,
-                            overdueDays: overdueDays > 0 ? overdueDays : 0,
-                        };
-                    }
-                    return book;
-                }),
+                isExtended: record.books.some((book) => book.giahan),
+                books: record.books.map((book) => ({
+                    ...book,
+                    isExtended: book.giahan || false,
+                    originalDueDate: book.ngayhentra || record.ngayhentra,
+                    overdueDays: book.tinhtrang && book.ngaytra
+                        ? (() => {
+                            const dueDate = new Date(book.newngayhentra || book.ngayhentra || record.ngayhentra);
+                            const returnDate = new Date(book.ngaytra);
+                            dueDate.setHours(0, 0, 0, 0);
+                            returnDate.setHours(0, 0, 0, 0);
+                            const diffTime = returnDate.getTime() - dueDate.getTime();
+                            const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                            return overdueDays > 0 ? overdueDays : 0;
+                        })()
+                        : 0,
+                })),
             }));
             setBorrowedRecords(updatedData);
             setFilteredRecords(applyCurrentFilters(updatedData));
+            // Cập nhật selectedRecord nếu đang mở modal
+            if (selectedRecord) {
+                const updatedRecord = updatedData.find((record) => record.maphieumuon === selectedRecord.maphieumuon);
+                if (updatedRecord) {
+                    setSelectedRecord(updatedRecord);
+                }
+            }
         } catch (err) {
             setBorrowedRecords([]);
             setFilteredRecords([]);
@@ -200,7 +209,7 @@ function HandleBook() {
     // Hủy các phiếu mượn chưa xác nhận
     const cancelUnconfirmedBorrows = async () => {
         try {
-            const response = await request.post('/api/cancelUnconfirmedBorrows');
+            const response = await request.get('/api/cancelUnconfirmedBorrows');
             if (response.data.success) {
                 await fetchBorrowedBooks();
             }
@@ -253,6 +262,46 @@ function HandleBook() {
         }
     }, [filteredRecords, itemsPerPage, currentPage]);
 
+    const notifyOverdue = async () => {
+        try {
+            await request.post('/api/notifyOverdue');
+            // Không cần toast vì đây là thông báo im lặng
+        } catch (err) {
+            // Xử lý lỗi im lặng
+            console.error('Lỗi khi gửi thông báo quá hạn:', err);
+        }
+    };
+
+// Hàm gọi API thông báo sắp đến hạn
+    const notifyDueSoon = async () => {
+        try {
+            await request.post('/api/notifyDueSoon');
+            // Không cần toast vì đây là thông báo im lặng
+        } catch (err) {
+            // Xử lý lỗi im lặng
+            console.error('Lỗi khi gửi thông báo sắp đến hạn:', err);
+        }
+    };
+
+// Cập nhật hàm initialize
+    useEffect(() => {
+        const initialize = async () => {
+            try {
+                // Gọi các API đồng thời để tối ưu thời gian
+                await Promise.all([
+                    cancelUnconfirmedBorrows(),
+                    notifyOverdue(),
+                    notifyDueSoon(),
+                    fetchBorrowedBooks(),
+                ]);
+            } catch (err) {
+                toast.error('Lỗi khi khởi tạo dữ liệu!');
+                console.error('Lỗi trong initialize:', err);
+            }
+        };
+        initialize();
+    }, []);
+
     // Xử lý lọc phiếu mượn
     const handleFilterSubmit = (e) => {
         e.preventDefault();
@@ -291,25 +340,48 @@ function HandleBook() {
         setShowFilterForm(false);
     };
 
-    // Xác nhận mượn sách
-    const handleConfirmBorrow = async (maphieumuon, masach) => {
+    // Xác nhận mượn tất cả sách trong phiếu mượn
+    const handleConfirmBorrow = async (maphieumuon) => {
         setIsLoading(true);
         try {
-            const response = await request.post('/api/confirmBorrowRequest', { maphieumuon, masach });
+            const response = await request.post('/api/confirmBorrowRequest', { maphieumuon });
             if (response.status === 200) {
-                const updatedRecords = borrowedRecords.map((record) =>
-                    record.maphieumuon === maphieumuon
-                        ? {
-                            ...record,
-                            books: record.books.map((book) =>
-                                book.masach === masach ? { ...book, confirm: true } : book
-                            ),
-                        }
-                        : record
+                setBorrowedRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) => ({
+                                    ...book,
+                                    confirm: true,
+                                })),
+                            }
+                            : record
+                    )
                 );
-                setBorrowedRecords(updatedRecords);
-                setFilteredRecords(applyCurrentFilters(updatedRecords));
-                toast.success('Xác nhận yêu cầu mượn sách thành công!');
+                setFilteredRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) => ({
+                                    ...book,
+                                    confirm: true,
+                                })),
+                            }
+                            : record
+                    )
+                );
+                if (selectedRecord && selectedRecord.maphieumuon === maphieumuon) {
+                    setSelectedRecord((prev) => ({
+                        ...prev,
+                        books: prev.books.map((book) => ({
+                            ...book,
+                            confirm: true,
+                        })),
+                    }));
+                }
+                toast.success('Xác nhận tất cả sách thành công!');
             }
         } catch (err) {
             toast.error(err.response?.data?.message || 'Lỗi khi xác nhận yêu cầu mượn!');
@@ -329,59 +401,67 @@ function HandleBook() {
                 ngaytra,
             });
             if (response.status === 200) {
-                const updatedRecords = borrowedRecords.map((record) =>
-                    record.maphieumuon === maphieumuon
-                        ? {
-                            ...record,
-                            books: record.books.map((book) => {
-                                if (book.masach === masach) {
-                                    const dueDate = book.ngayhentra || record.ngayhentra;
-                                    const returnDate = new Date(ngaytra);
-                                    const due = new Date(dueDate);
-                                    returnDate.setHours(0, 0, 0, 0);
-                                    due.setHours(0, 0, 0, 0);
-                                    const diffTime = returnDate.getTime() - due.getTime();
-                                    const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                                    const finalOverdueDays = overdueDays > 0 ? overdueDays : 0;
-
-                                    return {
-                                        ...book,
-                                        tinhtrang: true,
-                                        ngaytra,
-                                        overdueDays: finalOverdueDays,
-                                    };
-                                }
-                                return book;
-                            }),
-                        }
-                        : record
+                setBorrowedRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) =>
+                                    book.masach === masach
+                                        ? {
+                                            ...book,
+                                            tinhtrang: true,
+                                            ngaytra,
+                                            overdueDays: calculateOverdueDays(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra,
+                                                false
+                                            ),
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
                 );
-                setBorrowedRecords(updatedRecords);
-                setFilteredRecords(applyCurrentFilters(updatedRecords));
-                if (selectedRecord?.maphieumuon === maphieumuon) {
-                    setSelectedRecord({
-                        ...selectedRecord,
-                        books: selectedRecord.books.map((book) => {
-                            if (book.masach === masach) {
-                                const dueDate = book.ngayhentra || selectedRecord.ngayhentra;
-                                const returnDate = new Date(ngaytra);
-                                const due = new Date(dueDate);
-                                returnDate.setHours(0, 0, 0, 0);
-                                due.setHours(0, 0, 0, 0);
-                                const diffTime = returnDate.getTime() - due.getTime();
-                                const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                                const finalOverdueDays = overdueDays > 0 ? overdueDays : 0;
-
-                                return {
+                setFilteredRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) =>
+                                    book.masach === masach
+                                        ? {
+                                            ...book,
+                                            tinhtrang: true,
+                                            ngaytra,
+                                            overdueDays: calculateOverdueDays(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra,
+                                                false
+                                            ),
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
+                );
+                if (selectedRecord && selectedRecord.maphieumuon === maphieumuon) {
+                    setSelectedRecord((prev) => ({
+                        ...prev,
+                        books: prev.books.map((book) =>
+                            book.masach === masach
+                                ? {
                                     ...book,
                                     tinhtrang: true,
                                     ngaytra,
-                                    overdueDays: finalOverdueDays,
-                                };
-                            }
-                            return book;
-                        }),
-                    });
+                                    overdueDays: calculateOverdueDays(
+                                        book.newngayhentra || book.ngayhentra || prev.ngayhentra,
+                                        false
+                                    ),
+                                }
+                                : book
+                        ),
+                    }));
                 }
                 toast.success('Trả sách thành công!');
             }
@@ -402,95 +482,72 @@ function HandleBook() {
                 ngaytra,
             });
             if (response.status === 200) {
-                const updatedRecords = borrowedRecords.map((record) =>
-                    record.maphieumuon === maphieumuon
-                        ? {
-                            ...record,
-                            books: record.books.map((book) => {
-                                const dueDate = book.ngayhentra || record.ngayhentra;
-                                const returnDate = new Date(ngaytra);
-                                const due = new Date(dueDate);
-                                returnDate.setHours(0, 0, 0, 0);
-                                due.setHours(0, 0, 0, 0);
-                                const diffTime = returnDate.getTime() - due.getTime();
-                                const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                                const finalOverdueDays = overdueDays > 0 ? overdueDays : 0;
-
-                                return {
+                setBorrowedRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) =>
+                                    book.confirm && !book.tinhtrang
+                                        ? {
+                                            ...book,
+                                            tinhtrang: true,
+                                            ngaytra,
+                                            overdueDays: calculateOverdueDays(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra,
+                                                false
+                                            ),
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
+                );
+                setFilteredRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                books: record.books.map((book) =>
+                                    book.confirm && !book.tinhtrang
+                                        ? {
+                                            ...book,
+                                            tinhtrang: true,
+                                            ngaytra,
+                                            overdueDays: calculateOverdueDays(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra,
+                                                false
+                                            ),
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
+                );
+                if (selectedRecord && selectedRecord.maphieumuon === maphieumuon) {
+                    setSelectedRecord((prev) => ({
+                        ...prev,
+                        books: prev.books.map((book) =>
+                            book.confirm && !book.tinhtrang
+                                ? {
                                     ...book,
                                     tinhtrang: true,
                                     ngaytra,
-                                    overdueDays: finalOverdueDays,
-                                };
-                            }),
-                        }
-                        : record
-                );
-                setBorrowedRecords(updatedRecords);
-                setFilteredRecords(applyCurrentFilters(updatedRecords));
-                if (selectedRecord?.maphieumuon === maphieumuon) {
-                    setSelectedRecord({
-                        ...selectedRecord,
-                        books: selectedRecord.books.map((book) => {
-                            const dueDate = book.ngayhentra || selectedRecord.ngayhentra;
-                            const returnDate = new Date(ngaytra);
-                            const due = new Date(dueDate);
-                            returnDate.setHours(0, 0, 0, 0);
-                            due.setHours(0, 0, 0, 0);
-                            const diffTime = returnDate.getTime() - due.getTime();
-                            const overdueDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-                            const finalOverdueDays = overdueDays > 0 ? overdueDays : 0;
-
-                            return {
-                                ...book,
-                                tinhtrang: true,
-                                ngaytra,
-                                overdueDays: finalOverdueDays,
-                            };
-                        }),
-                    });
+                                    overdueDays: calculateOverdueDays(
+                                        book.newngayhentra || book.ngayhentra || prev.ngayhentra,
+                                        false
+                                    ),
+                                }
+                                : book
+                        ),
+                    }));
                 }
                 toast.success('Trả tất cả sách thành công!');
             }
         } catch (err) {
             toast.error(err.response?.data?.message || 'Lỗi khi trả sách!');
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
-    // Gia hạn tất cả sách
-    const handleExtendAllBorrowing = async (maphieumuon) => {
-        setIsLoading(true);
-        try {
-            const response = await request.post('/api/AdminExtendAllBooks', { maphieumuon });
-            if (response.status === 200) {
-                const updatedRecords = borrowedRecords.map((record) =>
-                    record.maphieumuon === maphieumuon
-                        ? {
-                            ...record,
-                            books: record.books.map((book) => ({
-                                ...book,
-                                ngayhentra: response.data.newDueDate,
-                            })),
-                        }
-                        : record
-                );
-                setBorrowedRecords(updatedRecords);
-                setFilteredRecords(applyCurrentFilters(updatedRecords));
-                if (selectedRecord?.maphieumuon === maphieumuon) {
-                    setSelectedRecord({
-                        ...selectedRecord,
-                        books: selectedRecord.books.map((book) => ({
-                            ...book,
-                            ngayhentra: response.data.newDueDate,
-                        })),
-                    });
-                }
-                toast.success('Gia hạn tất cả sách thành công!');
-            }
-        } catch (err) {
-            toast.error(err.response?.data?.message || 'Lỗi khi gia hạn!');
         } finally {
             setIsLoading(false);
         }
@@ -502,31 +559,188 @@ function HandleBook() {
         try {
             const response = await request.post('/api/AdminExtendBook', { maphieumuon, masach });
             if (response.status === 200) {
-                const updatedRecords = borrowedRecords.map((record) =>
-                    record.maphieumuon === maphieumuon
-                        ? {
-                            ...record,
-                            books: record.books.map((book) =>
-                                book.masach === masach
-                                    ? { ...book, ngayhentra: response.data.newDueDate }
-                                    : book
-                            ),
-                        }
-                        : record
+                // Cập nhật state tạm thời trước khi tải lại dữ liệu
+                const newDueDate = response.data.newngayhentra || (() => {
+                    const currentDueDate = new Date(
+                        borrowedRecords
+                            .find((record) => record.maphieumuon === maphieumuon)
+                            ?.books.find((book) => book.masach === masach)
+                            ?.newngayhentra ||
+                        borrowedRecords
+                            .find((record) => record.maphieumuon === maphieumuon)
+                            ?.books.find((book) => book.masach === masach)
+                            ?.ngayhentra
+                    );
+                    currentDueDate.setDate(currentDueDate.getDate() + 7);
+                    return normalizeDate(currentDueDate);
+                })();
+
+                setBorrowedRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                isExtended: record.books.some(
+                                    (book) => book.masach === masach || book.isExtended
+                                ),
+                                books: record.books.map((book) =>
+                                    book.masach === masach
+                                        ? {
+                                            ...book,
+                                            isExtended: true,
+                                            giahan: true,
+                                            newngayhentra: newDueDate,
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
                 );
-                setBorrowedRecords(updatedRecords);
-                setFilteredRecords(applyCurrentFilters(updatedRecords));
-                if (selectedRecord?.maphieumuon === maphieumuon) {
-                    setSelectedRecord({
-                        ...selectedRecord,
-                        books: selectedRecord.books.map((book) =>
+                setFilteredRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                isExtended: record.books.some(
+                                    (book) => book.masach === masach || book.isExtended
+                                ),
+                                books: record.books.map((book) =>
+                                    book.masach === masach
+                                        ? {
+                                            ...book,
+                                            isExtended: true,
+                                            giahan: true,
+                                            newngayhentra: newDueDate,
+                                        }
+                                        : book
+                                ),
+                            }
+                            : record
+                    )
+                );
+                if (selectedRecord && selectedRecord.maphieumuon === maphieumuon) {
+                    setSelectedRecord((prev) => ({
+                        ...prev,
+                        isExtended: prev.books.some(
+                            (book) => book.masach === masach || book.isExtended
+                        ),
+                        books: prev.books.map((book) =>
                             book.masach === masach
-                                ? { ...book, ngayhentra: response.data.newDueDate }
+                                ? {
+                                    ...book,
+                                    isExtended: true,
+                                    giahan: true,
+                                    newngayhentra: newDueDate,
+                                }
                                 : book
                         ),
-                    });
+                    }));
                 }
                 toast.success('Gia hạn thời gian mượn thành công!');
+                // Tải lại dữ liệu từ server
+                await fetchBorrowedBooks();
+            }
+        } catch (err) {
+            toast.error(err.response?.data?.message || 'Lỗi khi gia hạn!');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // Gia hạn tất cả sách chưa gia hạn và chưa trả
+    const handleExtendAllBorrowing = async (maphieumuon) => {
+        setIsLoading(true);
+        try {
+            const response = await request.post('/api/AdminExtendAllBooks', { maphieumuon });
+            if (response.status === 200) {
+                setBorrowedRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                isExtended: true,
+                                books: record.books.map((book) => {
+                                    if (book.confirm && !book.tinhtrang && !book.isExtended) {
+                                        const newDueDate = response.data.books?.find(
+                                            (b) => b.masach === book.masach
+                                        )?.newngayhentra || (() => {
+                                            const currentDueDate = new Date(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra
+                                            );
+                                            currentDueDate.setDate(currentDueDate.getDate() + 7);
+                                            return normalizeDate(currentDueDate);
+                                        })();
+                                        return {
+                                            ...book,
+                                            isExtended: true,
+                                            giahan: true,
+                                            newngayhentra: newDueDate,
+                                        };
+                                    }
+                                    return book;
+                                }),
+                            }
+                            : record
+                    )
+                );
+                setFilteredRecords((prevRecords) =>
+                    prevRecords.map((record) =>
+                        record.maphieumuon === maphieumuon
+                            ? {
+                                ...record,
+                                isExtended: true,
+                                books: record.books.map((book) => {
+                                    if (book.confirm && !book.tinhtrang && !book.isExtended) {
+                                        const newDueDate = response.data.books?.find(
+                                            (b) => b.masach === book.masach
+                                        )?.newngayhentra || (() => {
+                                            const currentDueDate = new Date(
+                                                book.newngayhentra || book.ngayhentra || record.ngayhentra
+                                            );
+                                            currentDueDate.setDate(currentDueDate.getDate() + 7);
+                                            return normalizeDate(currentDueDate);
+                                        })();
+                                        return {
+                                            ...book,
+                                            isExtended: true,
+                                            giahan: true,
+                                            newngayhentra: newDueDate,
+                                        };
+                                    }
+                                    return book;
+                                }),
+                            }
+                            : record
+                    )
+                );
+                if (selectedRecord && selectedRecord.maphieumuon === maphieumuon) {
+                    setSelectedRecord((prev) => ({
+                        ...prev,
+                        isExtended: true,
+                        books: prev.books.map((book) => {
+                            if (book.confirm && !book.tinhtrang && !book.isExtended) {
+                                const newDueDate = response.data.books?.find(
+                                    (b) => b.masach === book.masach
+                                )?.newngayhentra || (() => {
+                                    const currentDueDate = new Date(
+                                        book.newngayhentra || book.ngayhentra || prev.ngayhentra
+                                    );
+                                    currentDueDate.setDate(currentDueDate.getDate() + 7);
+                                    return normalizeDate(currentDueDate);
+                                })();
+                                return {
+                                    ...book,
+                                    isExtended: true,
+                                    giahan: true,
+                                    newngayhentra: newDueDate,
+                                };
+                            }
+                            return book;
+                        }),
+                    }));
+                }
+                toast.success('Gia hạn tất cả sách chưa gia hạn thành công!');
             }
         } catch (err) {
             toast.error(err.response?.data?.message || 'Lỗi khi gia hạn!');
@@ -578,7 +792,7 @@ function HandleBook() {
         const hasOverdue = books.some((book) =>
             book.tinhtrang
                 ? book.overdueDays > 0
-                : calculateOverdueDays(book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) > 0
+                : calculateOverdueDays(book.newngayhentra || book.ngayhentra || record.ngayhentra, book.tinhtrang, book.overdueDays) > 0
         );
         return hasOverdue ? 'Có' : 'Không';
     };
@@ -772,14 +986,7 @@ function HandleBook() {
                                         {record.books.some((book) => !book.confirm && !book.tinhtrang) && (
                                             <button
                                                 className="btn btn-success btn-sm w-100"
-                                                onClick={() =>
-                                                    record.books.forEach(
-                                                        (book) =>
-                                                            !book.confirm &&
-                                                            !book.tinhtrang &&
-                                                            handleConfirmBorrow(record.maphieumuon, book.masach)
-                                                    )
-                                                }
+                                                onClick={() => handleConfirmBorrow(record.maphieumuon)}
                                                 disabled={isLoading}
                                             >
                                                 Xác nhận
@@ -799,9 +1006,9 @@ function HandleBook() {
                                                 <button
                                                     className="btn btn-info btn-sm"
                                                     onClick={() => handleExtendAllBorrowing(record.maphieumuon)}
-                                                    disabled={isLoading}
+                                                    disabled={isLoading || record.isExtended}
                                                 >
-                                                    Gia Hạn Tất Cả
+                                                    {record.isExtended ? 'Đã Gia Hạn' : 'Gia Hạn Tất Cả'}
                                                 </button>
                                                 <button
                                                     className="btn btn-primary btn-sm"
@@ -932,7 +1139,9 @@ function HandleBook() {
                                     </thead>
                                     <tbody>
                                     {selectedRecord.books.map((book) => {
-                                        const dueDate = book.ngayhentra || selectedRecord.ngayhentra;
+                                        const dueDate = book.isExtended
+                                            ? book.newngayhentra
+                                            : book.originalDueDate || selectedRecord.ngayhentra;
                                         const overdueDays = calculateOverdueDays(dueDate, book.tinhtrang, book.overdueDays);
                                         return (
                                             <tr key={book.masach}>
@@ -971,18 +1180,22 @@ function HandleBook() {
                                                             >
                                                                 Trả Sách
                                                             </button>
-                                                            <button
-                                                                className="btn btn-info btn-sm"
-                                                                onClick={() =>
-                                                                    handleExtendBorrowing(
-                                                                        selectedRecord.maphieumuon,
-                                                                        book.masach
-                                                                    )
-                                                                }
-                                                                disabled={isLoading}
-                                                            >
-                                                                Gia Hạn
-                                                            </button>
+                                                            {book.isExtended ? (
+                                                                <span className="text-info">Đã Gia Hạn</span>
+                                                            ) : (
+                                                                <button
+                                                                    className="btn btn-info btn-sm"
+                                                                    onClick={() =>
+                                                                        handleExtendBorrowing(
+                                                                            selectedRecord.maphieumuon,
+                                                                            book.masach
+                                                                        )
+                                                                    }
+                                                                    disabled={isLoading}
+                                                                >
+                                                                    Gia Hạn
+                                                                </button>
+                                                            )}
                                                         </div>
                                                     ) : book.tinhtrang ? (
                                                         <span>{formatDate(book.ngaytra)}</span>
